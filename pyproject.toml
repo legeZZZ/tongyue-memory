@@ -30,6 +30,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-q"
 markers = [
   "integration: live DashScope embedding call; skipped unless an embedding key is set",

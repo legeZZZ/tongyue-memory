@@ -15,6 +15,7 @@ from typing import Protocol
 
 import httpx
 
+from mneme.attributes import same_mutable_attribute
 from mneme.embeddings import UpstreamError
 from mneme.timeparse import parse_iso, to_iso
 
@@ -45,10 +46,13 @@ SIM_SAME_REFERENT = 0.82
 JUDGE_SYSTEM = (
     "You compare one new memory fact with candidate old facts. Do not answer "
     "an external question. Each candidate includes same_spo (true when the "
-    "subject and predicate strings match) and sim (cosine similarity of the "
-    "two fact embeddings, from 0 to 1). Return JSON with keys kind (updates, "
-    "contradicts, or unrelated) and target_id (the old fact id, or null). "
-    "Treat the new fact as the same referent when same_spo is true, or when "
+    "subject and predicate strings match), same_attribute (true when both facts "
+    "are the same single-valued attribute for the same speaker, such as "
+    "residence, job, cat count, or favorite director), and sim (cosine "
+    "similarity of the two fact embeddings, from 0 to 1). Return JSON with keys "
+    "kind (updates, contradicts, or unrelated) and target_id (the old fact id, "
+    "or null). Treat the new fact as the same referent when same_spo is true, "
+    "when same_attribute is true even if the predicate wording differs, or when "
     f"sim is at least {SIM_SAME_REFERENT:.2f} even if the predicate wording differs. "
     "Use updates when it is the same referent, the objects conflict, and the "
     "new fact is the later state. Use contradicts when both cannot be true but "
@@ -183,15 +187,41 @@ class HeuristicLLM:
                 continue
             if cand.get("valid_to"):
                 continue
-            same_referent = _is_same_spo(new, cand) or _as_float(cand.get("sim")) >= SIM_SAME_REFERENT
+            same_referent = (
+                _is_same_spo(new, cand)
+                or bool(cand.get("same_attribute"))
+                or same_mutable_attribute(
+                    new.subject,
+                    new.predicate,
+                    new.object,
+                    new.statement,
+                    str(cand.get("subject") or ""),
+                    str(cand.get("predicate") or ""),
+                    str(cand.get("object") or ""),
+                    str(cand.get("statement") or ""),
+                )
+                or _as_float(cand.get("sim")) >= SIM_SAME_REFERENT
+            )
             if not same_referent:
                 continue
-            if cand.get("object") and new.object and not _same(cand.get("object"), new.object):
+            if _values_conflict(new, cand):
                 target = cand.get("id")
                 if target is None:
                     continue
                 return Verdict("updates", int(target))
         return Verdict("unrelated", None)
+
+
+def _values_conflict(new: FactDraft, cand: dict) -> bool:
+    left = (new.object or "").strip()
+    right = str(cand.get("object") or "").strip()
+    if left and right:
+        return not _same(left, right)
+    if not left and not right:
+        left_stmt = (new.statement or "").strip()
+        right_stmt = str(cand.get("statement") or "").strip()
+        return bool(left_stmt and right_stmt and not _same(left_stmt, right_stmt))
+    return False
 
 
 def _same(left: object, right: object) -> bool:

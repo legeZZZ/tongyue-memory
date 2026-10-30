@@ -72,9 +72,9 @@ Tests with fake models (no network, no keys):
 pytest
 ```
 
-`pytest -m "not real_llm"` is the same offline suite. `pytest -m integration` calls DashScope once and is skipped unless `DASHSCOPE_API_KEY` or `EMBEDDING_API_KEY` is set.
+`pytest -m "not real_llm and not integration"` is the offline suite, including `tests/test_live_failure_shapes.py` (the six shapes that failed on live gpt-4o-mini: city leak, empty job search, pet / residence / director drift, and the as-of city timeline). `pytest` from the repo root adds `src` to `PYTHONPATH` (see `pyproject.toml`). `pytest -m integration` calls DashScope once and is skipped unless `DASHSCOPE_API_KEY` or `EMBEDDING_API_KEY` is set.
 
-Real gpt-4o-mini regression (17 cases: current-state updates, as-of, wording drift, extract/supersede). The harness forces `fake_models=False` and does not read `MNEME_FAKE_MODELS`. It skips unless both an LLM key and an embedding key are exported. Nothing in the repo stores those keys.
+Real gpt-4o-mini regression (17 cases: current-state updates, as-of, wording drift, extract/supersede). The harness forces `fake_models=False` and does not read `MNEME_FAKE_MODELS`. It skips unless both an LLM key and an embedding key are exported. Nothing in the repo stores those keys. Re-run it with:
 
 ```bash
 # Chat: tryallapi gateway, or https://api.openai.com/v1

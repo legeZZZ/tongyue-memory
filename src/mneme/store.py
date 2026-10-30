@@ -649,6 +649,26 @@ class Store:
                 ids.add(row["b_fact"])
             return ids
 
+    def turn_ids_invalid_at(self, user_id: str, moment: str) -> set[int]:
+        """Turns whose facts are all outside ``moment``. Turns with no facts are kept."""
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT src_turn_id, ts_event, valid_from, valid_to
+                FROM facts
+                WHERE user_id = ? AND src_turn_id IS NOT NULL
+                """,
+                (user_id,),
+            ).fetchall()
+        by_src: dict[int, list] = {}
+        for row in rows:
+            by_src.setdefault(int(row["src_turn_id"]), []).append(row)
+        stale: set[int] = set()
+        for src, facts in by_src.items():
+            if facts and not any(_fact_row_valid_at(row, moment) for row in facts):
+                stale.add(src)
+        return stale
+
     def suppressed_turn_ids(self, user_id: str) -> set[int]:
         """Turns that only support a superseded fact. Current-tense search hides them."""
         with self._lock:
@@ -698,6 +718,12 @@ class Store:
             else:
                 row = self.conn.execute("SELECT COUNT(*) AS n FROM turns WHERE user_id = ?", (user_id,)).fetchone()
             return int(row["n"])
+
+
+def _fact_row_valid_at(row: sqlite3.Row, moment: str) -> bool:
+    start = row["valid_from"] or row["ts_event"]
+    valid_to = row["valid_to"]
+    return start <= moment and (valid_to is None or moment < valid_to)
 
 
 def _turn(row: sqlite3.Row) -> StoredTurn:

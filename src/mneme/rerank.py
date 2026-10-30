@@ -15,6 +15,12 @@ from mneme.tokenize import tokenize
 
 log = logging.getLogger(__name__)
 
+# "What is my job?" shares no tokens with "I work as a doctor". A hit on this
+# alias is enough to clear the default abstain threshold (TAU 0.25).
+_JOB_QUERY = {"job", "jobs", "occupation", "职业"}
+_JOB_DOC = {"job", "jobs", "occupation", "work", "works", "worked", "working", "职业", "工作"}
+_JOB_RELEVANCE = 0.5
+
 
 class Reranker(Protocol):
     def score(self, query: str, texts: list[str]) -> list[float]:
@@ -28,13 +34,17 @@ class LexicalReranker:
         q = set(tokenize(query))
         if not q:
             return [0.0 for _ in texts]
+        job_query = bool(q & _JOB_QUERY)
         out: list[float] = []
         for text in texts:
             t = set(tokenize(text))
             if not t:
                 out.append(0.0)
                 continue
-            out.append(len(q & t) / len(q))
+            overlap = len(q & t) / len(q)
+            if job_query and (t & _JOB_DOC):
+                overlap = max(overlap, _JOB_RELEVANCE)
+            out.append(overlap)
         return out
 
 
