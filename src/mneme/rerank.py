@@ -1,7 +1,7 @@
 """Pluggable rerankers.
 
 The default is a lexical overlap scorer so CI and a CPU box can boot without
-the 0.6B weights. Set ``MNEME_RERANKER=qwen3`` and install ``mneme[qwen]`` to
+the 0.6B weights. Set ``MNEME_RERANKER=qwen3`` and install ``tongyue-memory[qwen]`` to
 score with Qwen/Qwen3-Reranker-0.6B (Apache-2.0). Both return relevance in
 ``[0, 1]``, which is the σ(rerank logit) term in the final score.
 """
@@ -61,7 +61,7 @@ class Qwen3Reranker:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as exc:
             raise RuntimeError(
-                "Qwen3 reranker is not installed. Run pip install 'mneme[qwen]' "
+                "Qwen3 reranker is not installed. Run pip install 'tongyue-memory[qwen]' "
                 "(torch and transformers) and set MNEME_RERANKER=qwen3. "
                 "The default MNEME_RERANKER=lexical needs neither."
             ) from exc

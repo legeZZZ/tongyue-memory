@@ -38,7 +38,12 @@ def create_app(
         finally:
             app.state.service.close()
 
-    app = FastAPI(title="Mneme", version=__version__, lifespan=lifespan)
+    app = FastAPI(
+        title="同月记忆",
+        description="tongyue-memory textual memory service (academic track). Import package: mneme.",
+        version=__version__,
+        lifespan=lifespan,
+    )
     app.state.service = service
 
     @app.get("/health")

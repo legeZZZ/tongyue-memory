@@ -3,12 +3,12 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mneme"
+name = "tongyue-memory"
 version = "0.1.0"
-description = "Bitemporal textual memory service for Agent Memory Challenge Cycle 2 (academic, textual)."
+description = "同月记忆 (tongyue-memory): bitemporal textual memory service for Agent Memory Challenge Cycle 2 (academic, textual)."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "Mneme contributors" }]
+authors = [{ name = "tongyue-memory contributors" }]
 dependencies = [
   "fastapi>=0.115.0",
   "uvicorn>=0.32.0",
@@ -24,6 +24,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 mneme = "mneme.__main__:main"
+tongyue-memory = "mneme.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
