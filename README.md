@@ -66,13 +66,32 @@ When `MEMORY_SYSTEM_KEY` is set, send one of:
 -H "X-Api-Key: $MEMORY_SYSTEM_KEY"
 ```
 
-Tests (no network, no keys):
+Tests with fake models (no network, no keys):
 
 ```bash
 pytest
 ```
 
-`pytest -m integration` calls DashScope and is skipped unless `DASHSCOPE_API_KEY` or `EMBEDDING_API_KEY` is set.
+`pytest -m "not real_llm"` is the same offline suite. `pytest -m integration` calls DashScope once and is skipped unless `DASHSCOPE_API_KEY` or `EMBEDDING_API_KEY` is set.
+
+Real gpt-4o-mini regression (17 cases: current-state updates, as-of, wording drift, extract/supersede). The harness forces `fake_models=False` and does not read `MNEME_FAKE_MODELS`. It skips unless both an LLM key and an embedding key are exported. Nothing in the repo stores those keys.
+
+```bash
+# Chat: tryallapi gateway, or https://api.openai.com/v1
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="https://tryallapi.com/v1"
+export LLM_MODEL="gpt-4o-mini"
+
+# Embeddings stay on DashScope text-embedding-v4 (1024d)
+export DASHSCOPE_API_KEY="..."
+export EMBEDDING_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export EMBEDDING_MODEL="text-embedding-v4"
+export EMBEDDING_DIM="1024"
+
+pytest -m real_llm
+```
+
+International DashScope hosts can set `EMBEDDING_BASE_URL` to the `dashscope-intl` compatible-mode `/v1` URL instead. Omit `OPENAI_BASE_URL` to use `https://api.openai.com/v1`.
 
 ## Docker
 
@@ -147,7 +166,9 @@ Embedding requests are batches of 10, with at most 16 batches in flight, and eac
 rerank + β · time_fit + γ · src_bonus
 ```
 
-Items under `MNEME_RERANK_FLOOR` (default 0.08) are dropped so a time bonus cannot revive an unrelated memory. If the best remaining score is below `TAU`, Search returns `{"data": []}`. Otherwise neighbors (one turn on either side of a hit, same chunk) are appended and the list is cut to `top_k`. Verbatim turns are ordered before atomic facts. Sensitive text (health, identity documents, passwords) is omitted when the question does not mention it.
+Items under `MNEME_RERANK_FLOOR` (default 0.08) are dropped so a time bonus cannot revive an unrelated memory. Abstention looks at pure rerank relevance, not the combined score: if the best relevance is below `TAU`, Search returns `{"data": []}`. Time fit and source bonus still change order among survivors, and the returned `score` is that combined value. Otherwise neighbors (one turn on either side of a hit, same chunk) are appended and inherit the anchor's relevance, then the list is cut to `top_k`. Verbatim turns are ordered before atomic facts. Sensitive text (health, identity documents, passwords) is omitted when the question does not mention it.
+
+A current-tense question also drops an older turn that states the same subject and predicate as a later turn (`X的Y是Z` / `my X is Y`), even when fact extraction has not finished. Those turn ids are hidden for this search only, including when neighbor expansion would otherwise copy them back in. Conflict judgment treats two facts as the same referent when the subject and predicate strings match, or when their embedding cosine is at least 0.82.
 
 ## Reranker
 

@@ -39,12 +39,19 @@ ANALYZE_SYSTEM = (
     "any text that was not asked."
 )
 
+# Cosine at or above this means the same referent even when predicate wording drifted.
+SIM_SAME_REFERENT = 0.82
+
 JUDGE_SYSTEM = (
     "You compare one new memory fact with candidate old facts. Do not answer "
-    "an external question. Return JSON with keys kind (updates, contradicts, "
-    "or unrelated) and target_id (the old fact id, or null). Use updates only "
-    "when the same subject and predicate have a conflicting object and the new "
-    "fact is the later state. Use contradicts when both cannot be true but "
+    "an external question. Each candidate includes same_spo (true when the "
+    "subject and predicate strings match) and sim (cosine similarity of the "
+    "two fact embeddings, from 0 to 1). Return JSON with keys kind (updates, "
+    "contradicts, or unrelated) and target_id (the old fact id, or null). "
+    "Treat the new fact as the same referent when same_spo is true, or when "
+    f"sim is at least {SIM_SAME_REFERENT:.2f} even if the predicate wording differs. "
+    "Use updates when it is the same referent, the objects conflict, and the "
+    "new fact is the later state. Use contradicts when both cannot be true but "
     "order is unclear. Otherwise unrelated."
 )
 
@@ -171,20 +178,39 @@ class HeuristicLLM:
         return Analysis(tense=tense, as_of=as_of, hops=hops, recall_q=recall)
 
     def judge(self, new: FactDraft, candidates: list[dict]) -> Verdict:
-        if new.subject and new.predicate:
-            for cand in candidates:
-                if cand.get("status") not in {None, "active"}:
+        for cand in candidates:
+            if cand.get("status") not in {None, "active"}:
+                continue
+            if cand.get("valid_to"):
+                continue
+            same_referent = _is_same_spo(new, cand) or _as_float(cand.get("sim")) >= SIM_SAME_REFERENT
+            if not same_referent:
+                continue
+            if cand.get("object") and new.object and not _same(cand.get("object"), new.object):
+                target = cand.get("id")
+                if target is None:
                     continue
-                if not cand.get("valid_to") and _same(cand.get("subject"), new.subject) and _same(
-                    cand.get("predicate"), new.predicate
-                ):
-                    if cand.get("object") and new.object and not _same(cand.get("object"), new.object):
-                        return Verdict("updates", int(cand["id"]))
+                return Verdict("updates", int(target))
         return Verdict("unrelated", None)
 
 
 def _same(left: object, right: object) -> bool:
     return str(left or "").casefold().strip() == str(right or "").casefold().strip()
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_same_spo(new: FactDraft, cand: dict) -> bool:
+    if cand.get("same_spo") is True:
+        return True
+    return bool(new.subject) and bool(new.predicate) and _same(cand.get("subject"), new.subject) and _same(
+        cand.get("predicate"), new.predicate
+    )
 
 
 def _as_of_from_query(query: str) -> str | None:
