@@ -22,7 +22,17 @@ import numpy as np
 
 from mneme.config import Settings
 from mneme.embeddings import Embedder, UpstreamError, build_embedder
-from mneme.llm import Analysis, FactDraft, LLM, TurnView, build_llm, sensitivity_of
+from mneme.llm import (
+    Analysis,
+    FactDraft,
+    HeuristicLLM,
+    LLM,
+    TurnView,
+    Verdict,
+    build_llm,
+    parse_spo,
+    sensitivity_of,
+)
 from mneme.rerank import LexicalReranker, Reranker, build_reranker
 from mneme.schemas import AddRequest, AddResponse, SearchHit, SearchRequest, SearchResponse
 from mneme.scoring import combine, ranked_ids, rrf_fuse, src_bonus, time_fit
@@ -59,6 +69,7 @@ class Hit:
     src_turn_id: int | None = None
     record_id: int | None = None
     final: float = 0.0
+    relevance: float = 0.0
     in_update_pair: bool = False
     order_position: float = 0.0
 
@@ -156,20 +167,22 @@ class MemoryService:
         if analysis.hops > 1:
             keys = self._bridge(req.user_id, keys)
         hits = self._hits_for(req.user_id, keys)
-        hits = self._temporal_filter(hits, analysis, req.user_id)
+        # ``hidden`` is local to this search. Do not stash it on the service:
+        # concurrent searches would otherwise revive each other's stale turns.
+        hits, hidden = self._temporal_filter(hits, analysis, req.user_id)
         if not hits:
             return SearchResponse(data=[])
         hits = hits[: self.settings.rerank_max]
         scored = self._score(req.query, hits, analysis)
-        scored = [hit for hit in scored if hit.final >= self.settings.tau]
+        # Abstain on pure rerank. time_fit and src_bonus stay in ``final`` for rank only.
+        scored = [hit for hit in scored if hit.relevance >= self.settings.tau]
         if not scored:
             return SearchResponse(data=[])
         scored.sort(key=lambda hit: hit.final, reverse=True)
-        hidden = self.store.suppressed_turn_ids(req.user_id) if analysis.tense == "current" else set()
         picked = self._expand(scored, req.top_k, analysis, hidden)
         picked = _disclose(picked, req.query)
-        picked = [hit for hit in picked if hit.final >= self.settings.tau and hit.text.strip()]
-        if not picked or max(hit.final for hit in picked) < self.settings.tau:
+        picked = [hit for hit in picked if hit.relevance >= self.settings.tau and hit.text.strip()]
+        if not picked or max(hit.relevance for hit in picked) < self.settings.tau:
             return SearchResponse(data=[])
         picked = _raw_first(picked, analysis.tense)[: req.top_k]
         return SearchResponse(
@@ -248,7 +261,7 @@ class MemoryService:
         for draft, vec in zip(drafts, vectors, strict=True):
             ts = draft.ts_event or turns[0].ts_event
             candidates = self._reconcile_candidates(user_id, draft, vec)
-            verdict = self.llm.judge(draft, candidates)
+            verdict = self._judge(draft, candidates)
             confidence = draft.confidence
             valid_to: str | None = None
             status = "active"
@@ -310,7 +323,31 @@ class MemoryService:
             sim = float(np.dot(vec, other)) if other is not None and other.shape[0] == vec.shape[0] else 0.0
             ranked.append((same, sim, fact))
         ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [_candidate(fact) for _same, _sim, fact in ranked[:10]]
+        return [_candidate(fact, sim=sim, same_spo=bool(same)) for same, sim, fact in ranked[:10]]
+
+    def _judge(self, draft: FactDraft, candidates: list[dict]) -> Verdict:
+        """Ask the configured judge, then apply the sim/SPO rule if it abstains.
+
+        gpt-4o-mini sometimes returns unrelated when the predicate wording
+        drifted. The heuristic sees the same ``sim`` and ``same_spo`` fields,
+        so a later conflicting object still supersedes. Fake models already
+        are that heuristic; calling it twice would not change the verdict.
+        """
+        verdict = self.llm.judge(draft, candidates)
+        if isinstance(self.llm, HeuristicLLM):
+            return verdict
+        known: set[int] = set()
+        for cand in candidates:
+            try:
+                known.add(int(cand["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if verdict.kind == "updates" and verdict.target_id in known:
+            return verdict
+        backup = HeuristicLLM().judge(draft, candidates)
+        if backup.kind == "updates" and backup.target_id is not None:
+            return backup
+        return verdict
 
     def _analyze(self, query: str) -> Analysis:
         cached = self._cache.get(query)
@@ -342,17 +379,18 @@ class MemoryService:
                 hits.append(_hit_fact(record))
         return hits
 
-    def _temporal_filter(self, hits: list[Hit], analysis: Analysis, user_id: str) -> list[Hit]:
+    def _temporal_filter(self, hits: list[Hit], analysis: Analysis, user_id: str) -> tuple[list[Hit], set[int]]:
+        """Filter hits and return turn ids current-tense expansion must not revive."""
         tense = analysis.tense
         if tense == "current":
-            hidden = self.store.suppressed_turn_ids(user_id)
+            hidden = self._current_hidden(hits, user_id)
             kept: list[Hit] = []
             for hit in hits:
                 if hit.kind == "fact" and hit.status == "active" and not hit.valid_to:
                     kept.append(hit)
                 elif hit.kind == "turn" and hit.record_id not in hidden:
                     kept.append(hit)
-            return kept
+            return kept, hidden
         if tense == "as-of" and analysis.as_of:
             moment = analysis.as_of
             kept = []
@@ -364,11 +402,11 @@ class MemoryService:
                     start = hit.valid_from or hit.ts_event
                     if start <= moment and (hit.valid_to is None or moment < hit.valid_to):
                         kept.append(hit)
-            return kept
+            return kept, set()
         if tense == "delta":
             pair = self.store.update_pair_ids(user_id)
             if not pair:
-                return hits
+                return hits, set()
             kept = []
             for hit in hits:
                 if hit.kind == "fact" and hit.record_id in pair:
@@ -376,14 +414,94 @@ class MemoryService:
                     kept.append(hit)
                 elif hit.kind == "turn":
                     kept.append(hit)
-            return kept
+            return kept, set()
         if tense == "order":
             facts = sorted((hit for hit in hits if hit.kind == "fact"), key=lambda hit: hit.ts_event)
             span = max(len(facts) - 1, 1)
             for index, hit in enumerate(facts):
                 hit.order_position = index / span
-            return hits
-        return hits
+            return hits, set()
+        return hits, set()
+
+    def _current_hidden(self, hits: list[Hit], user_id: str) -> set[int]:
+        """Superseded sources, plus older same-referent turns enrich never linked.
+
+        Same (subject, predicate) from ``parse_spo`` keeps only the latest
+        ``ts_event``. Losers are returned to the caller so ``_expand`` cannot
+        pull them back in as neighbors. Computed per search, not stored.
+        """
+        hidden = set(self.store.suppressed_turn_ids(user_id))
+        hidden |= _spo_loser_ids(hits)
+        hidden |= self._older_same_spo_neighbor_ids(hits, hidden)
+        return hidden
+
+    def _older_same_spo_neighbor_ids(self, hits: list[Hit], already: set[int]) -> set[int]:
+        """Older same-referent turns just outside the recalled set.
+
+        Radius matches neighbor expansion. A current hit can sit next to a
+        stale line that recall dropped; expansion would otherwise append it.
+        """
+        radius = self.settings.neighbor_radius
+        if radius <= 0:
+            return set()
+        found: set[int] = set()
+        for hit in hits:
+            if hit.kind == "turn":
+                if hit.record_id is None or hit.record_id in already:
+                    continue
+                subject, predicate, _obj = parse_spo(hit.content_raw)
+                if not subject or not predicate or hit.chunk_id is None or hit.ordinal is None:
+                    continue
+                neighbor_ids = self.store.neighbor_turn_ids(
+                    hit.user_id, hit.chunk_id, hit.ordinal, radius
+                )
+                self._mark_older_turns(
+                    hit.user_id, neighbor_ids, subject, predicate, hit.ts_event, None, found
+                )
+            elif (
+                hit.kind == "fact"
+                and hit.status == "active"
+                and not hit.valid_to
+                and hit.src_turn_id is not None
+            ):
+                subject, predicate, _obj = parse_spo(hit.content_raw)
+                if not subject or not predicate:
+                    continue
+                loaded = self.store.load_records(hit.user_id, [f"t:{hit.src_turn_id}"])
+                for _key, record in loaded:
+                    if not isinstance(record, StoredTurn):
+                        continue
+                    around = self.store.neighbor_turn_ids(hit.user_id, record.chunk_id, record.ordinal, radius)
+                    self._mark_older_turns(
+                        hit.user_id, around, subject, predicate, hit.ts_event, record.id, found
+                    )
+        return found
+
+    def _mark_older_turns(
+        self,
+        user_id: str,
+        turn_ids: list[int],
+        subject: str,
+        predicate: str,
+        ts_event: str,
+        keep_id: int | None,
+        found: set[int],
+    ) -> None:
+        if not turn_ids:
+            return
+        subj = subject.casefold()
+        pred = predicate.casefold()
+        keys = [f"t:{turn_id}" for turn_id in turn_ids]
+        for _key, record in self.store.load_records(user_id, keys):
+            if not isinstance(record, StoredTurn):
+                continue
+            if keep_id is not None and record.id == keep_id:
+                continue
+            if record.ts_event >= ts_event:
+                continue
+            other_subj, other_pred, _obj = parse_spo(record.content)
+            if other_subj and other_pred and other_subj.casefold() == subj and other_pred.casefold() == pred:
+                found.add(record.id)
 
     def _score(self, query: str, hits: list[Hit], analysis: Analysis) -> list[Hit]:
         try:
@@ -411,6 +529,7 @@ class MemoryService:
                 order_position=hit.order_position,
             )
             source = src_bonus(hit.confidence, hit.provenance, hit.ts_event, now)
+            hit.relevance = relevance
             hit.final = combine(relevance, fit, source, self.settings.beta, self.settings.gamma)
             kept.append(hit)
         return kept
@@ -425,8 +544,12 @@ class MemoryService:
                     continue
                 if not _neighbor_ok(item, analysis, hidden):
                     continue
-                if item is not anchor and item.final < anchor.final:
-                    item.final = anchor.final * 0.99
+                if item is not anchor:
+                    if item.final < anchor.final:
+                        item.final = anchor.final * 0.99
+                    # Expansion does not rerank the neighbor. Inherit the anchor
+                    # so abstention, which reads relevance, keeps the context turn.
+                    item.relevance = anchor.relevance
                 seen.add(item.key)
                 selected.append(item)
                 if len(selected) >= top_k:
@@ -509,7 +632,27 @@ def _bind_source(draft: FactDraft, turns: list[StoredTurn]) -> FactDraft:
     return draft
 
 
-def _candidate(fact: StoredFact) -> dict:
+def _spo_loser_ids(hits: list[Hit]) -> set[int]:
+    """Turn ids that lose a same-referent current-tense comparison inside ``hits``."""
+    groups: dict[tuple[str, str], list[Hit]] = {}
+    for hit in hits:
+        if hit.kind != "turn" or hit.record_id is None:
+            continue
+        subject, predicate, _obj = parse_spo(hit.content_raw)
+        if not subject or not predicate:
+            continue
+        groups.setdefault((subject.casefold(), predicate.casefold()), []).append(hit)
+    losers: set[int] = set()
+    for group in groups.values():
+        winner = max(group, key=lambda hit: (hit.ts_event, hit.record_id or 0))
+        for hit in group:
+            if hit.record_id != winner.record_id:
+                losers.add(int(hit.record_id))
+    return losers
+
+
+def _candidate(fact: StoredFact, *, sim: float, same_spo: bool) -> dict:
+    clipped = max(0.0, min(1.0, float(sim)))
     return {
         "id": fact.id,
         "subject": fact.subject,
@@ -520,6 +663,8 @@ def _candidate(fact: StoredFact) -> dict:
         "valid_from": fact.valid_from,
         "valid_to": fact.valid_to,
         "status": fact.status,
+        "sim": round(clipped, 4),
+        "same_spo": bool(same_spo),
     }
 
 

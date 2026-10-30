@@ -9,7 +9,8 @@ Final score, after the reranker has already returned σ(logit) in ``[0, 1]``:
     final(d) = rerank(d) + β · time_fit(d) + γ · src_bonus(d)
 
 Defaults: β = 0.5, γ = 0.2, TAU = 0.25 (auditor override of the 0.35 blueprint
-value). Abstain when the best final score is below TAU.
+value). Abstain when the best pure rerank relevance is below TAU. ``final``
+orders the survivors; time fit and source bonus must not revive a weak hit.
 """
 
 from __future__ import annotations

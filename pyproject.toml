@@ -32,7 +32,8 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
 markers = [
-  "integration: live DashScope and OpenAI calls; skipped unless keys are set",
+  "integration: live DashScope embedding call; skipped unless an embedding key is set",
+  "real_llm: gpt-4o-mini plus text-embedding-v4 memory regressions; skipped unless both API keys are set",
 ]
 filterwarnings = [
   "error",
