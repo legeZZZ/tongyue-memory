@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+from mneme.attributes import same_mutable_attribute, text_referent
 from mneme.config import Settings
 from mneme.embeddings import Embedder, UpstreamError, build_embedder
 from mneme.llm import (
@@ -312,26 +313,40 @@ class MemoryService:
     def _reconcile_candidates(self, user_id: str, draft: FactDraft, vec: np.ndarray) -> list[dict]:
         facts = self.store.fact_rows_for_reconcile(user_id)
         vectors = {fact_id: emb for fact_id, emb in self.store.fact_embeddings(user_id)}
-        ranked: list[tuple[int, float, StoredFact]] = []
+        ranked: list[tuple[int, float, StoredFact, bool, bool]] = []
         for fact in facts:
-            same = int(
-                bool(draft.subject)
+            exact = bool(
+                draft.subject
                 and fact.subject.casefold() == draft.subject.casefold()
                 and fact.predicate.casefold() == draft.predicate.casefold()
             )
+            attribute = same_mutable_attribute(
+                draft.subject,
+                draft.predicate,
+                draft.object,
+                draft.statement,
+                fact.subject,
+                fact.predicate,
+                fact.object,
+                fact.statement,
+            )
             other = vectors.get(fact.id)
             sim = float(np.dot(vec, other)) if other is not None and other.shape[0] == vec.shape[0] else 0.0
-            ranked.append((same, sim, fact))
+            ranked.append((int(exact or attribute), sim, fact, exact, attribute))
         ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [_candidate(fact, sim=sim, same_spo=bool(same)) for same, sim, fact in ranked[:10]]
+        return [
+            _candidate(fact, sim=sim, same_spo=exact, same_attribute=attribute)
+            for _rank, sim, fact, exact, attribute in ranked[:10]
+        ]
 
     def _judge(self, draft: FactDraft, candidates: list[dict]) -> Verdict:
-        """Ask the configured judge, then apply the sim/SPO rule if it abstains.
+        """Ask the configured judge, then apply attribute, sim, or SPO if it abstains.
 
         gpt-4o-mini sometimes returns unrelated when the predicate wording
-        drifted. The heuristic sees the same ``sim`` and ``same_spo`` fields,
-        so a later conflicting object still supersedes. Fake models already
-        are that heuristic; calling it twice would not change the verdict.
+        drifted. The heuristic treats a known mutable attribute (residence, job,
+        cat count, favorite director) as the same referent even when cosine is
+        under 0.82, and still supersedes on ``sim`` / ``same_spo``. Fake models
+        already are that heuristic; calling it twice would not change the verdict.
         """
         verdict = self.llm.judge(draft, candidates)
         if isinstance(self.llm, HeuristicLLM):
@@ -353,7 +368,7 @@ class MemoryService:
         cached = self._cache.get(query)
         if cached is not None:
             return cached
-        analysis = self.llm.analyze(query)
+        analysis = _coerce_tense(query, self.llm.analyze(query))
         if len(self._cache) > 1024:
             self._cache.clear()
         self._cache[query] = analysis
@@ -390,19 +405,30 @@ class MemoryService:
                     kept.append(hit)
                 elif hit.kind == "turn" and hit.record_id not in hidden:
                     kept.append(hit)
+            drop = _older_attribute_fact_keys(kept)
+            for hit in kept:
+                if hit.key in drop and hit.src_turn_id is not None:
+                    hidden.add(hit.src_turn_id)
+            if drop or hidden:
+                kept = [
+                    hit
+                    for hit in kept
+                    if hit.key not in drop and not (hit.kind == "turn" and hit.record_id in hidden)
+                ]
             return kept, hidden
         if tense == "as-of" and analysis.as_of:
             moment = analysis.as_of
+            stale_turns = self.store.turn_ids_invalid_at(user_id, moment)
             kept = []
             for hit in hits:
                 if hit.kind == "turn":
-                    if hit.ts_event <= moment:
+                    if hit.ts_event <= moment and hit.record_id not in stale_turns:
                         kept.append(hit)
                 else:
                     start = hit.valid_from or hit.ts_event
                     if start <= moment and (hit.valid_to is None or moment < hit.valid_to):
                         kept.append(hit)
-            return kept, set()
+            return kept, stale_turns
         if tense == "delta":
             pair = self.store.update_pair_ids(user_id)
             if not pair:
@@ -426,9 +452,10 @@ class MemoryService:
     def _current_hidden(self, hits: list[Hit], user_id: str) -> set[int]:
         """Superseded sources, plus older same-referent turns enrich never linked.
 
-        Same (subject, predicate) from ``parse_spo`` keeps only the latest
-        ``ts_event``. Losers are returned to the caller so ``_expand`` cannot
-        pull them back in as neighbors. Computed per search, not stored.
+        Same mutable attribute, or the same ``parse_spo`` subject and predicate,
+        keeps only the latest ``ts_event``. Losers are returned to the caller so
+        ``_expand`` cannot pull them back in as neighbors. Computed per search,
+        not stored.
         """
         hidden = set(self.store.suppressed_turn_ids(user_id))
         hidden |= _spo_loser_ids(hits)
@@ -449,14 +476,14 @@ class MemoryService:
             if hit.kind == "turn":
                 if hit.record_id is None or hit.record_id in already:
                     continue
-                subject, predicate, _obj = parse_spo(hit.content_raw)
-                if not subject or not predicate or hit.chunk_id is None or hit.ordinal is None:
+                group = _turn_group_key(hit.content_raw)
+                if group is None or hit.chunk_id is None or hit.ordinal is None:
                     continue
                 neighbor_ids = self.store.neighbor_turn_ids(
                     hit.user_id, hit.chunk_id, hit.ordinal, radius
                 )
                 self._mark_older_turns(
-                    hit.user_id, neighbor_ids, subject, predicate, hit.ts_event, None, found
+                    hit.user_id, neighbor_ids, group, hit.ts_event, None, found
                 )
             elif (
                 hit.kind == "fact"
@@ -464,8 +491,8 @@ class MemoryService:
                 and not hit.valid_to
                 and hit.src_turn_id is not None
             ):
-                subject, predicate, _obj = parse_spo(hit.content_raw)
-                if not subject or not predicate:
+                group = _turn_group_key(hit.content_raw)
+                if group is None:
                     continue
                 loaded = self.store.load_records(hit.user_id, [f"t:{hit.src_turn_id}"])
                 for _key, record in loaded:
@@ -473,7 +500,7 @@ class MemoryService:
                         continue
                     around = self.store.neighbor_turn_ids(hit.user_id, record.chunk_id, record.ordinal, radius)
                     self._mark_older_turns(
-                        hit.user_id, around, subject, predicate, hit.ts_event, record.id, found
+                        hit.user_id, around, group, hit.ts_event, record.id, found
                     )
         return found
 
@@ -481,16 +508,13 @@ class MemoryService:
         self,
         user_id: str,
         turn_ids: list[int],
-        subject: str,
-        predicate: str,
+        group: tuple[str, str],
         ts_event: str,
         keep_id: int | None,
         found: set[int],
     ) -> None:
         if not turn_ids:
             return
-        subj = subject.casefold()
-        pred = predicate.casefold()
         keys = [f"t:{turn_id}" for turn_id in turn_ids]
         for _key, record in self.store.load_records(user_id, keys):
             if not isinstance(record, StoredTurn):
@@ -499,8 +523,7 @@ class MemoryService:
                 continue
             if record.ts_event >= ts_event:
                 continue
-            other_subj, other_pred, _obj = parse_spo(record.content)
-            if other_subj and other_pred and other_subj.casefold() == subj and other_pred.casefold() == pred:
+            if _turn_group_key(record.content) == group:
                 found.add(record.id)
 
     def _score(self, query: str, hits: list[Hit], analysis: Analysis) -> list[Hit]:
@@ -638,10 +661,10 @@ def _spo_loser_ids(hits: list[Hit]) -> set[int]:
     for hit in hits:
         if hit.kind != "turn" or hit.record_id is None:
             continue
-        subject, predicate, _obj = parse_spo(hit.content_raw)
-        if not subject or not predicate:
+        key = _turn_group_key(hit.content_raw)
+        if key is None:
             continue
-        groups.setdefault((subject.casefold(), predicate.casefold()), []).append(hit)
+        groups.setdefault(key, []).append(hit)
     losers: set[int] = set()
     for group in groups.values():
         winner = max(group, key=lambda hit: (hit.ts_event, hit.record_id or 0))
@@ -651,7 +674,61 @@ def _spo_loser_ids(hits: list[Hit]) -> set[int]:
     return losers
 
 
-def _candidate(fact: StoredFact, *, sim: float, same_spo: bool) -> dict:
+def _older_attribute_fact_keys(hits: list[Hit]) -> set[str]:
+    """Active facts that lose a same-attribute comparison to a newer fact in ``hits``."""
+    groups: dict[tuple[str, str], list[Hit]] = {}
+    for hit in hits:
+        if hit.kind != "fact" or hit.status != "active" or hit.valid_to:
+            continue
+        key = text_referent(hit.content_raw)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(hit)
+    drop: set[str] = set()
+    for group in groups.values():
+        winner = max(group, key=lambda hit: (hit.ts_event, hit.record_id or 0))
+        for hit in group:
+            if hit.key != winner.key:
+                drop.add(hit.key)
+    return drop
+
+
+def _turn_group_key(text: str) -> tuple[str, str] | None:
+    ref = text_referent(text)
+    if ref is not None:
+        return ref
+    subject, predicate, _obj = parse_spo(text)
+    if subject and predicate:
+        return ("spo", subject.casefold() + "\0" + predicate.casefold())
+    return None
+
+
+def _coerce_tense(query: str, analysis: Analysis) -> Analysis:
+    """Fill a missing or non-current label when the query is clearly present-tense.
+
+    gpt-4o-mini sometimes returns ``none`` or ``delta`` for 「现在」 / "right now".
+    Those labels skip the filter that hides superseded values. As-of questions
+    carry a date, so the heuristic does not call them current.
+    """
+    hinted = HeuristicLLM().analyze(query)
+    if hinted.tense == "current" and analysis.tense != "current":
+        return Analysis(
+            tense="current",
+            as_of=None,
+            hops=analysis.hops,
+            recall_q=analysis.recall_q or hinted.recall_q,
+        )
+    if analysis.tense == "none" and hinted.tense != "none":
+        return Analysis(
+            tense=hinted.tense,
+            as_of=hinted.as_of,
+            hops=analysis.hops,
+            recall_q=analysis.recall_q or hinted.recall_q,
+        )
+    return analysis
+
+
+def _candidate(fact: StoredFact, *, sim: float, same_spo: bool, same_attribute: bool = False) -> dict:
     clipped = max(0.0, min(1.0, float(sim)))
     return {
         "id": fact.id,
@@ -665,6 +742,7 @@ def _candidate(fact: StoredFact, *, sim: float, same_spo: bool) -> dict:
         "status": fact.status,
         "sim": round(clipped, 4),
         "same_spo": bool(same_spo),
+        "same_attribute": bool(same_attribute),
     }
 
 
@@ -728,7 +806,7 @@ def _raw_first(hits: list[Hit], tense: str) -> list[Hit]:
 
 
 def _neighbor_ok(hit: Hit, analysis: Analysis, hidden: set[int]) -> bool:
-    if analysis.tense == "current" and hit.kind == "turn" and hit.record_id in hidden:
+    if hit.kind == "turn" and hit.record_id in hidden and analysis.tense in {"current", "as-of"}:
         return False
     if analysis.tense == "as-of" and analysis.as_of and hit.ts_event > analysis.as_of:
         return False
