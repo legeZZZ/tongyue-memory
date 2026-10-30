@@ -1,0 +1,31 @@
+services:
+  mneme:
+    build: .
+    ports:
+      - "8097:8097"
+    environment:
+      MNEME_DB: /data/mneme.db
+      PORT: "8097"
+      MEMORY_SYSTEM_KEY: ${MEMORY_SYSTEM_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      MNEME_RERANKER: ${MNEME_RERANKER:-lexical}
+      QWEN_RERANKER_MODEL: ${QWEN_RERANKER_MODEL:-Qwen/Qwen3-Reranker-0.6B}
+      MNEME_TAU: ${MNEME_TAU:-0.25}
+      MNEME_BETA: ${MNEME_BETA:-0.5}
+      MNEME_GAMMA: ${MNEME_GAMMA:-0.2}
+      MNEME_FACT_TIMEOUT_S: ${MNEME_FACT_TIMEOUT_S:-12}
+      MNEME_FAKE_MODELS: ${MNEME_FAKE_MODELS:-0}
+      MNEME_FTS_SIMPLE: ${MNEME_FTS_SIMPLE:-}
+    volumes:
+      - mneme-data:/data
+    restart: unless-stopped
+
+volumes:
+  mneme-data:
