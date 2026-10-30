@@ -4,17 +4,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8097 \
     MNEME_DB=/data/mneme.db \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
+    PIP_TRUSTED_HOST=mirrors.cloud.tencent.com
 
 WORKDIR /app
 
-RUN useradd --create-home --uid 10001 mneme
+RUN useradd --create-home --uid 10001 mneme \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY docker/entrypoint.sh /entrypoint.sh
 
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir . \
     && chmod 755 /entrypoint.sh \
     && mkdir -p /data \
     && chown mneme:mneme /data
