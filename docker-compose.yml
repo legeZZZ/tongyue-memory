@@ -1,3 +1,5 @@
+# 同月记忆 (tongyue-memory). The compose service, volume, and image user stay
+# `mneme` so an existing stack, its data volume, and `python -m mneme` keep working.
 services:
   mneme:
     build: .

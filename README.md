@@ -1,6 +1,8 @@
-# Mneme
+# 同月记忆
 
-Mneme is a textual memory HTTP service for [Agent Memory Challenge Cycle 2](https://agentmemoryleaderboard.ai/), academic track, open-source methods. Version **0.1.0**.
+同月记忆 (tongyue-memory) is a textual memory HTTP service for [Agent Memory Challenge Cycle 2](https://agentmemoryleaderboard.ai/), academic track, open-source methods. Version **0.1.0**. Register and cite this system as **同月记忆** / **tongyue-memory**.
+
+The importable Python package is still `mneme` (`python -m mneme`, `MNEME_*` settings, SQLite file `mneme.db`). That module name is historical and is not the product name.
 
 It stores what was said, retrieves evidence for a question, and does not answer the question. The platform's Answer model reads the `data` array.
 
@@ -37,6 +39,7 @@ pip install -e ".[dev]"
 export MNEME_FAKE_MODELS=1          # offline smoke; do not use this for eval
 export MNEME_DB=./mneme.db
 python -m mneme                    # listens on 0.0.0.0:8097
+# equivalent console script after install: tongyue-memory
 ```
 
 With real models, leave `MNEME_FAKE_MODELS` unset and export `DASHSCOPE_API_KEY` and `OPENAI_API_KEY`. See `.env.example`.
@@ -177,7 +180,8 @@ The default reranker is lexical overlap. It needs no GPU and no download, which 
 To use Qwen3-Reranker-0.6B:
 
 ```bash
-pip install 'mneme[qwen]'
+pip install -e '.[qwen]'
+# distribution name, once published or installed by name: tongyue-memory[qwen]
 export MNEME_RERANKER=qwen3
 ```
 
@@ -185,7 +189,7 @@ The class loads `Qwen/Qwen3-Reranker-0.6B` and scores each passage by P(yes). Th
 
 ## Full-text Chinese
 
-FTS5's default unicode61 tokenizer treats a run of Han characters as one token, so Chinese queries miss. Mneme does not index raw Chinese that way.
+FTS5's default unicode61 tokenizer treats a run of Han characters as one token, so Chinese queries miss. 同月记忆 does not index raw Chinese that way.
 
 - If `MNEME_FTS_SIMPLE` points at a loadable [wangfenjin/simple](https://github.com/wangfenjin/simple) extension, the FTS table uses `tokenize='simple'`.
 - Otherwise the indexed text is jieba tokens separated by spaces, and a second FTS5 `trigram` table indexes the raw string. `GET /health` reports the mode (`jieba+trigram`, `jieba`, or `simple`).
@@ -204,9 +208,9 @@ src/mneme/rerank.py     lexical default, Qwen3 optional
 
 ## Attribution
 
-The dual store (verbatim turns plus atomic facts), radius-1 neighbor expansion, and dual-channel recall (original question plus a first-person recall probe) follow the recipe measured by [ActiveMemoryIndex](https://github.com/linxuhao/ActiveMemoryIndex) (linxuhao; Cycle 1 open-source textual). Mneme does not fork that repository.
+The dual store (verbatim turns plus atomic facts), radius-1 neighbor expansion, and dual-channel recall (original question plus a first-person recall probe) follow the recipe measured by [ActiveMemoryIndex](https://github.com/linxuhao/ActiveMemoryIndex) (linxuhao; Cycle 1 open-source textual). 同月记忆 does not fork that repository.
 
-Bitemporal validity (`valid_from`, `valid_to`, `superseded`), the cross-encoder rerank slot, and abstention below `TAU` are Mneme's. The interval model follows the idea in Zep/Graphiti (arXiv 2501.13956), not that codebase. RRF with k=60 is Cormack, Clarke, and Buettcher, SIGIR 2009. The Qwen3 reranker, when enabled, is QwenLM/Qwen3-Embedding (Apache-2.0).
+Bitemporal validity (`valid_from`, `valid_to`, `superseded`), the cross-encoder rerank slot, and abstention below `TAU` are part of 同月记忆. The interval model follows the idea in Zep/Graphiti (arXiv 2501.13956), not that codebase. RRF with k=60 is Cormack, Clarke, and Buettcher, SIGIR 2009. The Qwen3 reranker, when enabled, is QwenLM/Qwen3-Embedding (Apache-2.0).
 
 ## License
 

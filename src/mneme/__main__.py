@@ -1,4 +1,7 @@
-"""Run the Mneme HTTP service."""
+"""Run the 同月记忆 (tongyue-memory) HTTP service.
+
+The module path is ``python -m mneme``. ``tongyue-memory`` is an equivalent console script.
+"""
 
 from __future__ import annotations
 
