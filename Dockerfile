@@ -5,15 +5,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8097 \
     MNEME_DB=/data/mneme.db \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=100 \
     PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
     PIP_TRUSTED_HOST=mirrors.cloud.tencent.com
 
 WORKDIR /app
 
-RUN useradd --create-home --uid 10001 mneme \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --uid 10001 mneme
 
 COPY pyproject.toml README.md ./
 COPY src ./src
