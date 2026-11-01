@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -13,9 +15,13 @@ from fastapi.responses import JSONResponse
 from mneme import __version__
 from mneme.config import Settings
 from mneme.embeddings import UpstreamError
-from mneme.schemas import AddRequest, SearchRequest
+from mneme.schemas import AddRequest, SearchRequest, SearchResponse
 from mneme.service import MemoryService
 from mneme.store import Conflict
+
+# Local ranking can run a little past the upstream budget. The sum stays far
+# under Cloudflare's ~100s origin timeout, including when the budget is 20s.
+_SEARCH_TAIL_S = 15.0
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +35,12 @@ def create_app(
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     cfg = settings or Settings.from_env()
     service = MemoryService(cfg, embedder=embedder, llm=llm, reranker=reranker)
+    # Search does not share Starlette's pool with Add. A slow embed on Add
+    # cannot queue Search behind it until Cloudflare times out.
+    search_pool = ThreadPoolExecutor(
+        max_workers=max(1, cfg.search_workers),
+        thread_name_prefix="mneme-search",
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -36,6 +48,7 @@ def create_app(
         try:
             yield
         finally:
+            search_pool.shutdown(wait=False, cancel_futures=True)
             app.state.service.close()
 
     app = FastAPI(
@@ -47,8 +60,9 @@ def create_app(
     app.state.service = service
 
     @app.get("/health")
-    def health() -> dict:
+    async def health() -> dict:
         # Unauthenticated on purpose. Any 2xx means the process can serve Add.
+        # Async so a saturated Add pool cannot delay the probe.
         return {"status": "ok", "version": __version__, "fts": service.store.fts_mode}
 
     @app.post("/add")
@@ -69,10 +83,22 @@ def create_app(
             )
 
     @app.post("/search")
-    def search(body: SearchRequest, request: Request):
+    async def search(body: SearchRequest, request: Request):
         _authorize(request, cfg)
+        cap = max(0.0, cfg.search_budget_s) + _SEARCH_TAIL_S
+        loop = asyncio.get_running_loop()
         try:
-            return service.search(body)
+            return await asyncio.wait_for(
+                loop.run_in_executor(search_pool, service.search, body),
+                timeout=max(cap, 0.05),
+            )
+        except TimeoutError:
+            log.warning(
+                "search response cap %.1fs exceeded user=%s; returning empty evidence",
+                cap,
+                body.user_id,
+            )
+            return SearchResponse(data=[])
         except UpstreamError as exc:
             return JSONResponse(
                 status_code=503,

@@ -310,6 +310,10 @@ def live(tmp_path_factory):
         fact_timeout_s=120.0,
         llm_timeout_s=60.0,
         embedding_timeout_s=60.0,
+        # The serving default cuts a stalled Search well under Cloudflare's
+        # proxy limit. This harness is local and should still wait for gpt-4o-mini.
+        search_budget_s=180.0,
+        search_llm_timeout_s=60.0,
         memory_system_key=None,
         openai_api_key=openai_key,
         openai_base_url=_env("OPENAI_BASE_URL", "https://api.openai.com/v1"),

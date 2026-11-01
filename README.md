@@ -22,7 +22,7 @@ It stores what was said, retrieves evidence for a question, and does not answer 
 | `POST` | `/add` | key, if configured | `200` and `{"success": true, "request_id", "user_id", "session_id"}` |
 | `POST` | `/search` | key, if configured | `200` and `{"data": [{"id", "content", "score", "created_at"}]}` |
 
-Add returns 200 only after the verbatim turns, their embeddings, and the FTS rows are committed. Search can see that text immediately. Fact extraction waits up to `MNEME_FACT_TIMEOUT_S` (default 12s). If it overruns, the chunk stays on an offline queue and Add still returns 200.
+Add returns 200 only after the verbatim turns, their embeddings, and the FTS rows are committed. Search can see that text immediately. Fact extraction waits up to `MNEME_FACT_TIMEOUT_S` (default 12s). If it overruns, the chunk stays on an offline queue and Add still returns 200. At most `MNEME_ENRICH_CONCURRENCY` extractions run at once (default 2). Further chunks stay queued so a Full-eval Add burst cannot pin SQLite or the LLM client.
 
 The same `request_id` with the same body returns 200 and does not write again. The same `request_id` with a different body returns 409.
 
@@ -109,6 +109,19 @@ curl -sS http://127.0.0.1:8097/health
 
 SQLite lives in the `mneme-data` volume (`/data/mneme.db`). Run one process. The store uses a process lock around SQLite; extra uvicorn workers would serialize on that lock and are not the intended deploy.
 
+Search is built to answer inside `MNEME_SEARCH_BUDGET_S` (default 20s) plus about 15s of local ranking, well under a public tunnel's ~100s origin limit. Rebuild the app container when these change. Do not restart cloudflared or any other tunnel process; that is what keeps the public URL stable.
+
+```bash
+cd /opt/tongyue
+git fetch origin
+git checkout main
+git reset --hard origin/main
+docker compose up --build -d
+curl -sS http://127.0.0.1:8097/health
+```
+
+`git reset --hard` drops local edits under `/opt/tongyue` (for example a hand-edited compose file). The variables above are already passed through `docker-compose.yml`. Put overrides in the deploy `.env`, not only in the shell.
+
 Caddy, on the host:
 
 ```caddy
@@ -140,13 +153,19 @@ Submit the public `https://memory.example.com/add` and `/search` URLs plus `GET 
 | Variable | Default | Role |
 | --- | --- | --- |
 | `MEMORY_SYSTEM_KEY` | unset | If set, required on `/add` and `/search`. `/health` ignores it. |
-| `DASHSCOPE_API_KEY` / `EMBEDDING_API_KEY` | unset | Key for text-embedding-v4. Missing key: health stays up, Add returns 503. |
+| `DASHSCOPE_API_KEY` / `EMBEDDING_API_KEY` | unset | Key for text-embedding-v4. Missing key: health stays up, Add and Search return 503. |
 | `EMBEDDING_BASE_URL` | DashScope compatible-mode `/v1` | OpenAI-compatible base. International hosts can point this at `dashscope-intl`. |
 | `EMBEDDING_MODEL` | `text-embedding-v4` | Locked for the academic track. |
 | `EMBEDDING_DIM` | `1024` | Sent as `dimensions`. |
+| `EMBEDDING_TIMEOUT_S` | `40` | Per-call timeout for text-embedding-v4. Search may use a shorter slice. |
 | `OPENAI_API_KEY` | unset | gpt-4o-mini. If unset, extraction falls back to a local heuristic. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Chat completions base. |
 | `LLM_MODEL` | `gpt-4o-mini` | Locked for the academic track. |
+| `LLM_TIMEOUT_S` | `30` | Per-call timeout for fact extract and conflict judgment. |
+| `MNEME_SEARCH_BUDGET_S` | `20` | Wall clock for Search upstream calls. After this, Search continues with what it has. The handler stops 15s later; keep that sum under 80s on a public tunnel. |
+| `MNEME_SEARCH_LLM_TIMEOUT_S` | `8` | Cap for tense labeling on the Search path. A miss uses the local heuristic and is not cached. |
+| `MNEME_ENRICH_CONCURRENCY` | `2` | Fact-extraction jobs in flight. `0` leaves every chunk queued. |
+| `MNEME_SEARCH_WORKERS` | `48` | Threads used only by `/search`. |
 | `MNEME_RERANKER` | `lexical` | `lexical` or `qwen3`. |
 | `QWEN_RERANKER_MODEL` | `Qwen/Qwen3-Reranker-0.6B` | Used only when the reranker is `qwen3`. |
 | `MNEME_TAU` | `0.25` | Abstain when the best combined score is below this. |
@@ -163,7 +182,7 @@ Embedding requests are batches of 10, with at most 16 batches in flight, and eac
 
 **Add.** Parse an event time from the text (absolute dates, then relatives such as `三天后` / `last week`, anchored on the message timestamp). If no time is present, the message timestamp or ingest time is stored. Event time is never null. Embed with `text_type=document`, then commit turns + FTS. A background step asks gpt-4o-mini for atomic facts and reconciles conflicts in bitemporal form: the old fact gets `valid_to`, `status=superseded`, and `superseded_by`. It is not deleted.
 
-**Search.** Classify the question as current, as-of, delta, order, or none, and rewrite a first-person recall probe. Neither step is allowed to answer. Recall is dense over turns and facts for the question, dense again for the recall probe, and sparse BM25, fused with RRF at k=60. A temporal filter then drops superseded facts for "current" questions, keeps the valid interval for "as-of", and keeps both sides of an update for "delta". The reranker scores survivors. Final score is
+**Search.** Classify the question as current, as-of, delta, order, or none, and rewrite a first-person recall probe. Neither step is allowed to answer. Those two upstream calls run together: gpt-4o-mini analyze, and the query embedding. Each is sliced by the time left in `MNEME_SEARCH_BUDGET_S` (analyze also by `MNEME_SEARCH_LLM_TIMEOUT_S`). If analyze does not return, Search uses the local heuristic for that request and does not cache the fallback. If the query embedding times out or is rate-limited, Search continues with BM25. A missing embedding key is still **503**. Recall is dense over turns and facts for the question, dense again for the recall probe when the first vector landed and at least a second remains, and sparse BM25, fused with RRF at k=60. A temporal filter then drops superseded facts for "current" questions, keeps the valid interval for "as-of", and keeps both sides of an update for "delta". The reranker scores survivors. Final score is
 
 ```text
 rerank + β · time_fit + γ · src_bonus

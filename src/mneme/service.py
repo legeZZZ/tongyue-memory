@@ -7,6 +7,11 @@ returns 200: the raw text is already searchable.
 
 Search returns evidence only. It does not answer the question and it does not
 read ``options`` (choice text is not memory and is not a gold label).
+
+Search is capped by ``search_budget_s``. Analyze and the query embedding run
+together. If either is still going when its slice ends, Search keeps going:
+heuristic tense labels, and FTS when the query vector never arrives. A failed
+analyze is not cached, so a later Search can still use gpt-4o-mini.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -22,7 +28,7 @@ import numpy as np
 
 from mneme.attributes import same_mutable_attribute, text_referent
 from mneme.config import Settings
-from mneme.embeddings import Embedder, UpstreamError, build_embedder
+from mneme.embeddings import Embedder, UpstreamError, build_embedder, upstream_timeout_s
 from mneme.llm import (
     Analysis,
     FactDraft,
@@ -91,6 +97,8 @@ class MemoryService:
         self.reranker = reranker if reranker is not None else build_reranker(settings.reranker, settings.qwen_model)
         self._lexical = LexicalReranker()
         self._cache: dict[str, Analysis] = {}
+        self._cache_lock = threading.Lock()
+        self._enrich_slots = threading.Semaphore(max(0, int(settings.enrich_concurrency)))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -155,13 +163,20 @@ class MemoryService:
         if not self.store.has_user(req.user_id):
             return SearchResponse(data=[])
 
-        analysis = self._analyze(req.query)
-        q_vec = self.embedder.embed_texts([req.query], text_type="query")[0]
-        lists: list[list[str]] = [self.store.vector_topk(req.user_id, q_vec, self.settings.recall_limit)]
-        recall = (analysis.recall_q or "").strip()
-        if recall and recall != req.query.strip():
-            rq = self.embedder.embed_texts([recall], text_type="query")[0]
-            lists.append(self.store.vector_topk(req.user_id, rq, self.settings.recall_limit))
+        deadline = time.monotonic() + max(0.0, self.settings.search_budget_s)
+        analysis, q_vec = self._analyze_and_embed(req.query, deadline)
+        lists: list[list[str]] = []
+        if q_vec is not None:
+            lists.append(self.store.vector_topk(req.user_id, q_vec, self.settings.recall_limit))
+            recall = (analysis.recall_q or "").strip()
+            if recall and recall != req.query.strip():
+                recall_timeout = _slice(self.settings.embedding_timeout_s, deadline)
+                # A second probe is worth it only when the primary vector landed
+                # and there is still time. Skipping it beats a Cloudflare 524.
+                if recall_timeout >= 1.0:
+                    rq = self._embed_query(recall, recall_timeout)
+                    if rq is not None:
+                        lists.append(self.store.vector_topk(req.user_id, rq, self.settings.recall_limit))
         lists.append(self.store.fts_topk(req.user_id, req.query, self.settings.recall_limit))
         fused = rrf_fuse(lists, k=self.settings.rrf_k)
         keys = ranked_ids(fused)[: self.settings.recall_limit]
@@ -202,16 +217,20 @@ class MemoryService:
         """Run fact extraction until the budget. Timeout leaves the job queued."""
         if self.store.enrich_status(chunk_id, user_id) == "done":
             return True
+        if not self._enrich_slots.acquire(blocking=False):
+            log.info("enrich deferred for chunk %s; concurrency cap", chunk_id)
+            return False
         done = threading.Event()
         box: dict[str, object] = {}
 
         def target() -> None:
             try:
-                box["ok"] = self.enrich_once(chunk_id, user_id)
+                box["ok"] = self._enrich_job(chunk_id, user_id)
             except Exception as exc:  # noqa: BLE001 — raw write already durable
                 box["err"] = exc
                 log.warning("enrich failed for chunk %s: %s", chunk_id, exc)
             finally:
+                self._enrich_slots.release()
                 done.set()
 
         threading.Thread(target=target, name=f"enrich-{chunk_id[:24]}", daemon=True).start()
@@ -221,6 +240,15 @@ class MemoryService:
         return bool(box.get("ok"))
 
     def enrich_once(self, chunk_id: str, user_id: str) -> bool:
+        if not self._enrich_slots.acquire(blocking=False):
+            log.info("enrich deferred for chunk %s; concurrency cap", chunk_id)
+            return False
+        try:
+            return self._enrich_job(chunk_id, user_id)
+        finally:
+            self._enrich_slots.release()
+
+    def _enrich_job(self, chunk_id: str, user_id: str) -> bool:
         turns = self.store.claim_enrich(chunk_id, user_id)
         if turns is None:
             return self.store.enrich_status(chunk_id, user_id) == "done"
@@ -237,10 +265,14 @@ class MemoryService:
         if job is None:
             return False
         chunk_id, user_id = job
+        if not self._enrich_slots.acquire(blocking=False):
+            return False
         try:
-            self.enrich_once(chunk_id, user_id)
+            self._enrich_job(chunk_id, user_id)
         except Exception:
             log.warning("queued enrich failed for %s", chunk_id, exc_info=True)
+        finally:
+            self._enrich_slots.release()
         return True
 
     def _loop(self) -> None:
@@ -365,14 +397,120 @@ class MemoryService:
         return verdict
 
     def _analyze(self, query: str) -> Analysis:
-        cached = self._cache.get(query)
+        with self._cache_lock:
+            cached = self._cache.get(query)
         if cached is not None:
             return cached
-        analysis = _coerce_tense(query, self.llm.analyze(query))
-        if len(self._cache) > 1024:
-            self._cache.clear()
-        self._cache[query] = analysis
+        degraded = False
+        try:
+            raw = self.llm.analyze(query)
+        except Exception as exc:  # noqa: BLE001 — heuristic keeps Search moving
+            log.warning("analyze failed (%s); using heuristic", exc)
+            degraded = True
+            raw = HeuristicLLM().analyze(query)
+        else:
+            degraded = _llm_degraded(self.llm)
+            if degraded:
+                log.info("analyze degraded to heuristic; not caching")
+        analysis = _coerce_tense(query, raw)
+        if not degraded:
+            self._remember_analysis(query, analysis)
         return analysis
+
+    def _remember_analysis(self, query: str, analysis: Analysis) -> None:
+        with self._cache_lock:
+            if len(self._cache) > 1024:
+                self._cache.clear()
+            self._cache[query] = analysis
+
+    def _analyze_and_embed(self, query: str, deadline: float) -> tuple[Analysis, np.ndarray | None]:
+        """Run tense labeling and the query embedding together, then stop waiting."""
+        llm_timeout = _slice(self.settings.search_llm_timeout_s, deadline)
+        embed_timeout = _slice(self.settings.embedding_timeout_s, deadline)
+        if llm_timeout <= 0 and embed_timeout <= 0:
+            log.info("search budget exhausted before upstream calls; FTS + heuristic")
+            return _coerce_tense(query, HeuristicLLM().analyze(query)), None
+
+        analysis_box: dict[str, Analysis] = {}
+        embed_box: dict[str, object] = {}
+
+        def run_analyze() -> None:
+            token = upstream_timeout_s.set(llm_timeout)
+            try:
+                if llm_timeout <= 0:
+                    analysis_box["value"] = _coerce_tense(query, HeuristicLLM().analyze(query))
+                    return
+                analysis_box["value"] = self._analyze(query)
+            except Exception as exc:  # noqa: BLE001 — caller falls back if the box is empty
+                analysis_box["error"] = exc  # type: ignore[assignment]
+            finally:
+                upstream_timeout_s.reset(token)
+
+        def run_embed() -> None:
+            token = upstream_timeout_s.set(embed_timeout)
+            try:
+                if embed_timeout <= 0:
+                    return
+                embed_box["value"] = self.embedder.embed_texts([query], text_type="query")[0]
+            except Exception as exc:  # noqa: BLE001 — classified by the caller
+                embed_box["error"] = exc
+            finally:
+                upstream_timeout_s.reset(token)
+
+        analyze_thread = threading.Thread(target=run_analyze, name="mneme-search-analyze", daemon=True)
+        embed_thread = threading.Thread(target=run_embed, name="mneme-search-embed", daemon=True)
+        analyze_thread.start()
+        embed_thread.start()
+        end = time.monotonic() + max(llm_timeout, embed_timeout) + 0.15
+        while analyze_thread.is_alive() or embed_thread.is_alive():
+            if time.monotonic() >= end:
+                break
+            analyze_thread.join(0.02)
+            embed_thread.join(0.02)
+
+        if "value" in analysis_box:
+            analysis = analysis_box["value"]
+        else:
+            log.info("search analyze exceeded %.2fs; using heuristic", llm_timeout)
+            analysis = _coerce_tense(query, HeuristicLLM().analyze(query))
+
+        vector = self._vector_from_box(embed_box, embed_thread, embed_timeout)
+        return analysis, vector
+
+    def _embed_query(self, text: str, timeout_s: float) -> np.ndarray | None:
+        if timeout_s <= 0:
+            return None
+        box: dict[str, object] = {}
+
+        def run() -> None:
+            token = upstream_timeout_s.set(timeout_s)
+            try:
+                box["value"] = self.embedder.embed_texts([text], text_type="query")[0]
+            except Exception as exc:  # noqa: BLE001
+                box["error"] = exc
+            finally:
+                upstream_timeout_s.reset(token)
+
+        thread = threading.Thread(target=run, name="mneme-search-recall", daemon=True)
+        thread.start()
+        thread.join(timeout_s + 0.15)
+        return self._vector_from_box(box, thread, timeout_s)
+
+    def _vector_from_box(
+        self, box: dict[str, object], thread: threading.Thread, timeout_s: float
+    ) -> np.ndarray | None:
+        value = box.get("value")
+        if isinstance(value, np.ndarray):
+            return value
+        if "error" in box:
+            exc = box["error"]
+            if isinstance(exc, UpstreamError) and not _embed_degradable(exc):
+                raise exc
+            log.warning("search embed degraded (%s); continuing with FTS", exc)
+            return None
+        if thread.is_alive():
+            log.info("search embed exceeded %.2fs; continuing with FTS", timeout_s)
+        return None
 
     def _bridge(self, user_id: str, keys: list[str]) -> list[str]:
         seeds = [int(key[2:]) for key in keys if key.startswith("f:")]
@@ -701,6 +839,28 @@ def _turn_group_key(text: str) -> tuple[str, str] | None:
     if subject and predicate:
         return ("spo", subject.casefold() + "\0" + predicate.casefold())
     return None
+
+
+def _slice(limit: float, deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or limit <= 0:
+        return 0.0
+    return min(float(limit), remaining)
+
+
+def _llm_degraded(llm: object) -> bool:
+    tls = getattr(llm, "_tls", None)
+    return bool(getattr(tls, "degraded", False))
+
+
+def _embed_degradable(exc: UpstreamError) -> bool:
+    """Timeouts and rate limits can fall back to FTS. A missing key cannot."""
+    message = exc.message.casefold()
+    if "not configured" in message:
+        return False
+    if "http 401" in message or "http 403" in message:
+        return False
+    return True
 
 
 def _coerce_tense(query: str, analysis: Analysis) -> Analysis:
