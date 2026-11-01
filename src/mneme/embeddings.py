@@ -7,6 +7,7 @@ speaks the DashScope OpenAI-compatible embeddings endpoint and always sends
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,24 @@ import numpy as np
 from mneme.tokenize import tokenize
 
 log = logging.getLogger(__name__)
+
+# Search sets this so one stalled call cannot keep the client's full timeout.
+# Unset on Add and on fact extraction, which keep LLM_TIMEOUT_S / EMBEDDING_TIMEOUT_S.
+upstream_timeout_s: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "mneme_upstream_timeout_s", default=None
+)
+
+HTTP_LIMITS = httpx.Limits(max_connections=256, max_keepalive_connections=64)
+
+
+def effective_timeout(default: float) -> float:
+    """Per-call cap. A search slice only shortens the client default."""
+    override = upstream_timeout_s.get()
+    if override is None:
+        return default
+    if override <= 0:
+        return 0.001
+    return min(default, override)
 
 
 class UpstreamError(Exception):
@@ -92,6 +111,7 @@ class DashScopeEmbedder:
         self._client = httpx.Client(
             timeout=timeout_s,
             transport=transport,
+            limits=HTTP_LIMITS,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         )
 
@@ -106,9 +126,11 @@ class DashScopeEmbedder:
         batches = [texts[i : i + self.batch_size] for i in range(0, len(texts), self.batch_size)]
         ordered: list[list[np.ndarray] | None] = [None] * len(batches)
         workers = min(16, len(batches))
+        ctx = contextvars.copy_context()
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(self._embed_batch, batch, text_type): index for index, batch in enumerate(batches)
+                pool.submit(ctx.run, self._embed_batch, batch, text_type): index
+                for index, batch in enumerate(batches)
             }
             for fut in as_completed(futures):
                 ordered[futures[fut]] = fut.result()
@@ -128,7 +150,7 @@ class DashScopeEmbedder:
             "text_type": text_type,
         }
         try:
-            response = self._client.post(self._url, json=payload)
+            response = self._client.post(self._url, json=payload, timeout=effective_timeout(self.timeout_s))
         except httpx.HTTPError as exc:
             raise UpstreamError(f"embedding request failed: {exc.__class__.__name__}") from exc
         if response.status_code == 429 or response.status_code >= 500:

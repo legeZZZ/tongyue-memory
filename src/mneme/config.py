@@ -51,6 +51,12 @@ class Settings:
     openai_api_key: str | None = None
     llm_model: str = "gpt-4o-mini"
     llm_timeout_s: float = 30.0
+    # Search stops waiting on analyze / embeddings after this many seconds and
+    # still returns. The HTTP handler adds a short tail on top (see app.py).
+    search_budget_s: float = 20.0
+    search_llm_timeout_s: float = 8.0
+    enrich_concurrency: int = 2
+    search_workers: int = 48
     reranker: str = "lexical"
     qwen_model: str = "Qwen/Qwen3-Reranker-0.6B"
     tau: float = 0.25
@@ -89,6 +95,10 @@ class Settings:
             openai_api_key=_str("OPENAI_API_KEY"),
             llm_model=_str("LLM_MODEL", "gpt-4o-mini") or "gpt-4o-mini",
             llm_timeout_s=_float("LLM_TIMEOUT_S", 30.0),
+            search_budget_s=_float("MNEME_SEARCH_BUDGET_S", 20.0),
+            search_llm_timeout_s=_float("MNEME_SEARCH_LLM_TIMEOUT_S", 8.0),
+            enrich_concurrency=max(0, _int("MNEME_ENRICH_CONCURRENCY", 2)),
+            search_workers=max(1, _int("MNEME_SEARCH_WORKERS", 48)),
             reranker=(_str("MNEME_RERANKER", "lexical") or "lexical").lower(),
             qwen_model=_str("QWEN_RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
             or "Qwen/Qwen3-Reranker-0.6B",

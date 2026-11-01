@@ -10,13 +10,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
 
 from mneme.attributes import same_mutable_attribute
-from mneme.embeddings import UpstreamError
+from mneme.embeddings import HTTP_LIMITS, UpstreamError, effective_timeout
 from mneme.timeparse import parse_iso, to_iso
 
 log = logging.getLogger(__name__)
@@ -279,10 +280,13 @@ class OpenAILLM:
         if not api_key:
             raise UpstreamError("OPENAI_API_KEY is not configured")
         self.model = model
+        self._timeout_s = timeout_s
         self._fallback = HeuristicLLM()
+        self._tls = threading.local()
         self._client = httpx.Client(
             timeout=timeout_s,
             transport=transport,
+            limits=HTTP_LIMITS,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         )
         self._url = base_url.rstrip("/") + "/chat/completions"
@@ -334,9 +338,11 @@ class OpenAILLM:
         return drafts or self._fallback.extract(turns)
 
     def analyze(self, query: str) -> Analysis:
+        self._tls.degraded = False
         try:
             data = self._complete(ANALYZE_SYSTEM, query)
         except (UpstreamError, ValueError, KeyError) as exc:
+            self._tls.degraded = True
             log.warning("analyze fell back to heuristic: %s", exc)
             return self._fallback.analyze(query)
         tense = str(data.get("tense") or "none")
@@ -385,7 +391,9 @@ class OpenAILLM:
             ],
         }
         try:
-            response = self._client.post(self._url, json=body)
+            response = self._client.post(
+                self._url, json=body, timeout=effective_timeout(self._timeout_s)
+            )
         except httpx.HTTPError as exc:
             raise UpstreamError(f"llm request failed: {exc.__class__.__name__}") from exc
         if response.status_code >= 400:
